@@ -32,6 +32,9 @@ options:
 -l \<0-4> - log level (none/changes/errors/trace/debug)  
 -f \<tracefile> e.g. /tmp/log/tradfri_mqtt.log  
 
+All devices are polled every 10 seconds and changes to any parameters are published. This keeps track of any changes from dimmers/tradfri app.
+The gateway device list is polled every 15 minutes to discover new devices.
+
 ## MQTT commands
 For status subscribe to tradfri/status/#  
 Daemon will publish to status topics each time a value changes (all values reported at startup or when a new device is discovered)  
