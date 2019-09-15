@@ -36,13 +36,13 @@ options:
 For status subscribe to tradfri/status/#  
 Daemon will publish to status topics each time a value changes (all values reported at startup or when a new device is discovered)  
 bulbs:  
-if mains power state changes **tradfri/status/<devicename>/lamp** and **tradfri/status/<deviceid>/lamp** message is **'1'** or **'0'**   
-if brightness changes **tradfri/status/<devicename>/brightness** and **tradfri/status/<deviceid>/brightness** message is **'0'** - **'100'**  
-if colour temperature changes **tradfri/status/<devicename>/temp** and **tradfri/status/<deviceid>/temp** message is **'0'** - **'100'**  
-if on/off state changes **tradfri/status/<devicename>/power** and **tradfri/status/<deviceid>/power** message is **'1'** or **'0'**   
+if mains power state changes **tradfri/status/\<devicename>/lamp** and **tradfri/status/\<deviceid>/lamp** message is **'1'** or **'0'**   
+if brightness changes **tradfri/status/\<devicename>/brightness** and **tradfri/status/\<deviceid>/brightness** message is **'0'** - **'100'**  
+if colour temperature changes **tradfri/status/\<devicename>/temp** and **tradfri/status/\<deviceid>/temp** message is **'0'** - **'100'**  
+if on/off state changes **tradfri/status/\<devicename>/power** and **tradfri/status/\<deviceid>/power** message is **'1'** or **'0'**   
 outlets:  
-if on/off state changes **tradfri/status/<devicename>/power** and **tradfri/status/<deviceid>/power** message is **'1'** or **'0'**   
-if mains power state changes **tradfri/status/<devicename>/mains** and **tradfri/status/<deviceid>/mains** message is **'1'** or **'0'**   
+if on/off state changes **tradfri/status/\<devicename>/power** and **tradfri/status/\<deviceid>/power** message is **'1'** or **'0'**   
+if mains power state changes **tradfri/status/\<devicename>/mains** and **tradfri/status/\<deviceid>/mains** message is **'1'** or **'0'**   
   
 devicename is the name of the individual device from the tradfri application  
 deviceid is the internal identifier used by the tradfri gateway  
