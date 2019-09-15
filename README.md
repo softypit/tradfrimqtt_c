@@ -21,16 +21,16 @@ This daemon depends on libmosquitto, libjson-c, libcoap and libtinydtls
 ## usage
 tradfrimqtt <opts> OR use the start script - this can be used with systemd or init.d  
 options:  
--d <time in s> - startup delay - use if broker runs on localhost and starting at boot to give the broker time to start  
--u "<username>" - username for the tradfri gateway  
--k "<key>" - key for tradfri gateway  
--g "<tradfri gateway ip>" - ip of tradfri gateway  
--b "<broker ip>" - ip for mqtt broker  
+-d \<time in s> - startup delay - use if broker runs on localhost and starting at boot to give the broker time to start  
+-u "\<username>" - username for the tradfri gateway  
+-k "\<key>" - key for tradfri gateway  
+-g "\<tradfri gateway ip>" - ip of tradfri gateway  
+-b "\<broker ip>" - ip for mqtt broker  
 -c "tradfriclient" - mqtt client id  
--s <port (default 1883)> - mqtt port  
--t <basetopic (default tradfri/)> - mqtt base topic for publish/subscription  
--l <0-4> - log level (none/changes/errors/trace/debug)  
--f <tracefile> e.g. /tmp/log/tradfri_mqtt.log  
+-s \<port (default 1883)> - mqtt port  
+-t \<basetopic (default tradfri/)> - mqtt base topic for publish/subscription  
+-l \<0-4> - log level (none/changes/errors/trace/debug)  
+-f \<tracefile> e.g. /tmp/log/tradfri_mqtt.log  
 
 ## MQTT commands
 For status subscribe to tradfri/status/#  
