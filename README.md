@@ -47,7 +47,7 @@ if mains power state changes **tradfri/status/<devicename>/mains** and **tradfri
 devicename is the name of the individual device from the tradfri application  
 deviceid is the internal identifier used by the tradfri gateway  
   
-To send commands publish to **tradfri/set/<devicename>/<parameter>** or **tradfri/set/<deviceid>/<parameter>** or **tradfri/set/<groupname>/<parameter>**   
+To send commands publish to **tradfri/set//<devicename>//<parameter>** or **tradfri/set//<deviceid>//<parameter>** or **tradfri/set//<groupname>//<parameter>**   
 'power', 'brightness' and 'temp' parameters are writeable but will be ignored if not valid for the device type (e.g. temp for single-colour bulbs or outlets).  
 groupname can be used to set all devices within a group (group name from tradfri app).  
 
