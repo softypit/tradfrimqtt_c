@@ -14,6 +14,8 @@ My limited testing indicates the gateway remains more stable using this mechanis
 
 ## Testing
 This has been tested with my tradfri gateway with 12 bulbs and an outlet controlled via mqtt from openhab.
+New for 0.95 is restarting the DTLS session after a few failed polls. This fixes a previous issue where after a reset of the gateway
+a manual reset of this application was required. 
 
 ## Build
 This daemon depends on libmosquitto, libjson-c, libcoap and libtinydtls
@@ -30,10 +32,13 @@ options:
 -s \<port (default 1883)> - mqtt port  
 -t \<basetopic (default tradfri/)> - mqtt base topic for publish/subscription  
 -l \<0-4> - log level (none/changes/errors/trace/debug)  
--f \<tracefile> e.g. /tmp/log/tradfri_mqtt.log  
+-f \<tracefile> e.g. /tmp/log/tradfri_mqtt.log
+-w \<waittime> maximum wait time for response
 
 All devices are polled every 10 seconds and changes to any parameters are published. This keeps track of any changes from dimmers/tradfri app.
 The gateway device list is polled every 15 minutes to discover new devices.
+
+After a reset of the gateway the CoAP DTLS session needs to restart. The session restarts after 5 failed attempts to poll the gateway. 
 
 ## MQTT commands
 For status subscribe to tradfri/status/#  
@@ -54,6 +59,4 @@ To send commands publish to **tradfri/set/\<devicename>/\<parameter>** or **trad
 'power', 'brightness' and 'temp' parameters are writeable but will be ignored if not valid for the device type (e.g. temp for single-colour bulbs or outlets).  
 groupname can be used to set all devices within a group (group name from tradfri app).  
 
-## Issues
-In a few weeks of testing with a number of devices connected I have seen a single occasion where the main polling thread gets stuck. I have not managed to debug this fully yet
-but restarting the daemon fixed things so it doesn't seem like a tradfri gateway problem.
+

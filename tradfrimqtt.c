@@ -43,6 +43,8 @@
 
 /* Defaults */
 
+#define APP_VERSION "0.95"
+
 #define DEFAULT_MQTT_START_DELAY 5 /* 5 second delay to allow broker to start */
 
 #define GATEWAY_POLLTIME_S 10   /* Poll device and group parameters every 10 seconds */
@@ -86,6 +88,7 @@ bool logfifo = false;
 int delaystart = DEFAULT_MQTT_START_DELAY;
 
 #define LOG_NONE   0
+#define LOG_ALWAYS 0
 #define LOG_CHANGE 1
 #define LOG_ERR    2
 #define LOG_TRC    3
@@ -165,8 +168,9 @@ method_t method = 1;                    /* the method we are using in our reques
 
 coap_block_t block = { .num = 0, .m = 0, .szx = 6 };
 
-unsigned int wait_seconds = 90;         /* default timeout in seconds */
+unsigned int wait_seconds = 5;          /* default timeout in seconds */
 coap_tick_t max_wait;                   /* global timeout (changed by set_timeout()) */
+unsigned int numfails;
 
 unsigned int obs_seconds = 30;          /* default observe time */
 coap_tick_t obs_wait = 0;               /* timeout for current subscription */
@@ -717,6 +721,7 @@ struct device {
      int id;
      char *name;
      bool report;
+     bool removed;
      enum _devicetype type; 
      void *typedata;
      struct device *next;
@@ -770,6 +775,7 @@ struct group {
     int desiredpower;
     int brightness;
     int desiredbrightness;
+    bool removed;
     struct group *next;
     /* Make sure this is at the end */
     struct grp_devlist *devices;
@@ -791,6 +797,7 @@ static int newdevice(int id){
         newdevice->type = DEVICE_TYPE_UNKNOWN;
         newdevice->typedata = NULL;
         newdevice->report = false;
+        newdevice->removed = false;
         newdevice->next = NULL;
         if(devicehead == NULL){
             devicehead = newdevice;
@@ -801,6 +808,29 @@ static int newdevice(int id){
             devicewalk->next = newdevice;
         }
         rc = 0;
+    }
+    return rc;
+}
+
+static int deletedevice(struct device *dev){
+    int rc = -1;
+    struct device *prevdev = NULL, *thisdev = devicehead;
+    while(thisdev != NULL){
+        if(thisdev == dev){
+            if(prevdev == NULL)
+                devicehead = dev->next;
+            else
+                prevdev->next = dev->next;
+            if(dev->name != NULL)
+                free(dev->name);
+            if(dev->typedata != NULL)
+                free(dev->typedata);
+            free(dev);
+            rc = 0;
+            break;
+        }
+        prevdev = thisdev;
+        thisdev = thisdev->next;
     }
     return rc;
 }
@@ -817,6 +847,7 @@ static int newgroup(int id){
         newgroup->brightness = 0;
         newgroup->desiredbrightness = NOCHANGE;
         newgroup->devices = NULL;
+        newgroup->removed = false;
         newgroup->next = NULL;
         if(grouphead == NULL){
             grouphead = newgroup;
@@ -827,6 +858,29 @@ static int newgroup(int id){
             groupwalk->next = newgroup;
         }
         rc = 0;
+    }
+    return rc;
+}
+
+static int deletegroup(struct group *grp){
+    int rc = -1;
+    struct group *prevgrp = NULL, *thisgrp = grouphead;
+    while(thisgrp != NULL){
+        if(thisgrp == grp){
+            if(prevgrp == NULL)
+                grouphead = grp->next;
+            else
+                prevgrp->next = grp->next;
+            if(grp->name != NULL)
+                free(grp->name);
+            if(grp->devices != NULL)
+                free(grp->devices);
+            free(grp);
+            rc = 0;
+            break;
+        }
+        prevgrp = thisgrp;
+        thisgrp = thisgrp->next;
     }
     return rc;
 }
@@ -1027,12 +1081,13 @@ static int update_device(struct device *thisdevice){
         }
         json_object_put(jobj);
     }else{
+        numfails++;
         TRADFRILOG(LOG_ERR, "Error polling %s\n", thisdevice->name);
     }
     if(output != NULL){
         free(output);
     }
-    return 0;
+    return res;
 }
 
 static int command_device(struct device *dev, enum _tradfri_cmd command, char *param){
@@ -1131,6 +1186,16 @@ static struct device *finddevid(int devid){
         devwalk = devwalk->next;
     }
     return NULL;
+}
+
+
+/* Flag all devices removed until we reconfirm their existence */
+static void flagalldevicesremoved(void){
+    struct device *devwalk = devicehead;
+    while(devwalk != NULL){
+        devwalk->removed = true;
+        devwalk = devwalk->next;
+    }
 }
 
 /* Read the details from the gateway for this group */
@@ -1253,13 +1318,24 @@ static struct group *findgroupid(int groupid){
     }
     return NULL;
 }
+
+/* Flag all groups removed until we reconfirm their existence */
+static void flagallgroupsremoved(void){
+    struct group *grpwalk = grouphead;
+    while(grpwalk != NULL){
+        grpwalk->removed = true;
+        grpwalk = grpwalk->next;
+    }
+}
     
 /* Run through the device list and send any changes */
+/* coap_execute errors cause a non-zero return to trigger a context reset */
 static int rundeviceupdate(void){
     struct device *thisdev = devicehead;
     char path[100];
     char payload[150];
     char *output = NULL;
+    int rc = 0;
     while(thisdev != NULL){
         
         switch(thisdev->type){
@@ -1269,16 +1345,26 @@ static int rundeviceupdate(void){
                 if(thisbulb->desiredpower != NOCHANGE){
                     sprintf(path, "15001/%d", thisdev->id);
                     sprintf(payload, SET_BULB_POWER, thisbulb->desiredpower);
-                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0)
+                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0){
                         thisbulb->desiredpower = NOCHANGE;
-                    free(output);
+                    }else{
+                        rc = 1;
+                        numfails++;
+                    }
+                    if(output != NULL)
+                        free(output);
                 }
                 if(thisbulb->desiredbrightness != NOCHANGE){
                     sprintf(path, "15001/%d", thisdev->id);
                     sprintf(payload, SET_BULB_DIMMER, thisbulb->desiredbrightness);
-                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0)
+                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0){
                         thisbulb->desiredbrightness = NOCHANGE;
-                    free(output);
+                    }else{
+                        rc = 1;
+                        numfails++;
+                    }
+                    if(output != NULL)
+                        free(output);
                 }
                 if(thisbulb->desiredcolour != NOCHANGE){
                     int tempx = CONVERTTEMP_PC_TO_X(thisbulb->desiredcolour);  /* 24930 - 33135 */  /* 0x6162 - 0x816f */
@@ -1288,10 +1374,16 @@ static int rundeviceupdate(void){
                     //sprintf(payload, SET_TEMP, (int)((float)(thisbulb->desiredcolour) * 655.35));
                     //sprintf(payload, SET_TEMP, thisbulb->desiredcolour * 2 + 250);
                     //sprintf(payload, SET_TEMP, ((2200 - 4000) / 100) * thisbulb->desiredcolour + 220);
-                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0)
+                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0){
                         thisbulb->desiredbrightness = NOCHANGE;
-                    free(output);
-                    thisbulb->desiredcolour = NOCHANGE;
+                        thisbulb->desiredcolour = NOCHANGE;
+                    }else{
+                        rc = 1;
+                        numfails++;
+                    }
+                    if(output != NULL)
+                        free(output);
+                    
                 }
             }
             break;
@@ -1301,9 +1393,14 @@ static int rundeviceupdate(void){
                 if(thisoutlet->desiredpower != NOCHANGE){
                     sprintf(path, "15001/%d", thisdev->id);
                     sprintf(payload, SET_OUTLET_POWER, thisoutlet->desiredpower);
-                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0)
+                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0){
                         thisoutlet->desiredpower = NOCHANGE;
-                    free(output);
+                    }else{
+                        rc = 1;
+                        numfails++;
+                    }
+                    if(output != NULL)
+                        free(output);
                 }
             }
             break;
@@ -1312,7 +1409,7 @@ static int rundeviceupdate(void){
         }
         thisdev = thisdev->next;
     }
-    return 0;
+    return rc;
 }
 
 static int rundevicereport(void){
@@ -1395,13 +1492,16 @@ static int rundevicereport(void){
     return 0;
 }
 
-/* TODO check for devices/groups removed */
-
 /* Read devices and groups */
-static void check_gateway(void){
+static int check_gateway(void){
     char *output = NULL;
     int res;
     char path[200];
+    struct device *dev = NULL;
+    struct group *grp = NULL;
+    
+    /* Flag all devices as removed until we confirm they still exist */
+    flagalldevicesremoved();
     
     /* Read the device list */
     sprintf(path, "15001");
@@ -1415,9 +1515,15 @@ static void check_gateway(void){
             finddevice++;
             while(finddevice != NULL && *finddevice != 0){
                 deviceid = strtol(finddevice, &finddevice, 10);
-                if(deviceid != 0 && finddevid(deviceid) == NULL){
-                    TRADFRILOG(LOG_CHANGE, "Found new device id %d\n", deviceid);
-                    newdevice(deviceid);
+                if(deviceid != 0){
+                    dev = finddevid(deviceid);
+                    if(dev == NULL){
+                        TRADFRILOG(LOG_CHANGE, "Found new device id %d\n", deviceid);
+                        newdevice(deviceid);
+                    }else{
+                        /* Confirm device still exists */
+                        dev->removed = false;
+                    }
                 }
                 if(finddevice != NULL){
                     if(*finddevice == ']')
@@ -1429,11 +1535,25 @@ static void check_gateway(void){
         }
     }else{
         TRADFRILOG(LOG_ERR, "Error - Unable to poll devices\n");
+        return res;
     }
     if(output != NULL){
         free(output);
         output = NULL;
     }
+    
+    /* Remove devices that are no longer reported by the gateway */
+    dev = devicehead;
+    while(dev != NULL){
+        if(dev->removed == true){
+            TRADFRILOG(LOG_CHANGE, "Device %d (%s) removed from gateway\n", dev->id, dev->name);
+            deletedevice(dev);
+        }
+        dev = dev->next;
+    }
+    
+    /* Flag all groups as removed until we confirm they still exist */
+    flagallgroupsremoved();
       
     /* Read the group list */
     sprintf(path, "15004");
@@ -1447,9 +1567,14 @@ static void check_gateway(void){
             walkgroups++;
             while(walkgroups != NULL && *walkgroups != 0){
                 groupid = strtol(walkgroups, &walkgroups, 10);
-                if(groupid != 0 && findgroupid(groupid) == NULL){
-                    TRADFRILOG(LOG_CHANGE, "Found new group id %d\n", groupid);
-                    newgroup(groupid);
+                if(groupid != 0){
+                    if((grp = findgroupid(groupid)) == NULL){
+                        TRADFRILOG(LOG_CHANGE, "Found new group id %d\n", groupid);
+                        newgroup(groupid);
+                    }else{
+                        /* Confirm group still exists */
+                        grp->removed = false;
+                    }
                 }
                 if(walkgroups != NULL){
                     if(*walkgroups == ']')
@@ -1461,13 +1586,24 @@ static void check_gateway(void){
         }
     }else{
         TRADFRILOG(LOG_ERR, "Error - Unable to poll groups\n");
+        return res;
     }
     if(output != NULL){
         free(output);
         output = NULL;
     }
     
-    return;
+    /* Remove groups that are no longer reported by the gateway */
+    grp = grouphead;
+    while(grp != NULL){
+        if(grp->removed == true){
+            TRADFRILOG(LOG_CHANGE, "Group %d (%s) removed from gateway\n", grp->id, grp->name);
+            deletegroup(grp);
+        }
+        grp = grp->next;
+    }
+    
+    return res;
 }
 
 
@@ -1477,7 +1613,7 @@ int main(int argc, char **argv){
     char *brokerurl = NULL;
     int mqttport = 1883;
     
-    while ((opt = getopt(argc, argv, "ou:k:g:p:c:b:s:l:f:d:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "ou:k:g:p:c:b:s:l:f:d:t:w:")) != -1) {
         switch (opt) {
             case 'u':
                 user = strdup(optarg);
@@ -1526,14 +1662,21 @@ int main(int argc, char **argv){
                             basetopic = malloc(len + 2);
                             sprintf(basetopic, "%s/", optarg);
                         }else{
-                            TRADFRILOG(LOG_ERR, "Failed to allocate base topic - using default %s\n", basetopic);
+                            printf("Failed to allocate base topic - using default %s\n", basetopic);
                         }
                     }
                 }
+                break;
+            case 'w':
+                wait_seconds = strtol(optarg, NULL, 10);
+                break;
         }
     }
     
     setup_log();
+    
+    TRADFRILOG(LOG_ALWAYS, "Starting tradfri_mqttc\n", APP_VERSION);
+    TRADFRILOG(LOG_ALWAYS, "tradfri_mqttc v%s\n", APP_VERSION);
     
     coap_dtls_set_log_level(log_level);
     coap_set_log_level(log_level);
@@ -1551,112 +1694,128 @@ int main(int argc, char **argv){
     dst.size = res;
     dst.addr.sin.sin_port = htons(gateway_port);
 
-    switch (dst.addr.sa.sa_family) {
-    case AF_INET:
-//        addrptr = &dst.addr.sin.sin_addr;
-
-        /* create context for IPv4 */
-        ctx = get_context("0.0.0.0", "0", 1);
-        break;
-    case AF_INET6:
-//        addrptr = &dst.addr.sin6.sin6_addr;
-
-        /* create context for IPv6 */
-        ctx = get_context("::", "0", 1);
-        break;
-    default:
-        ;
-    }
-
-    if (!ctx) {
-        TRADFRILOG(LOG_ERR, "cannot create tradfri COAP context\n");
-        exit(-1);
-    }
-    
-    coap_keystore_item_t *psk;
-    psk = coap_keystore_new_psk(NULL, 0, user, (size_t)userlen, key, (size_t)keylen, 0);
-    if (!psk || !coap_keystore_store_item(ctx->keystore, psk, NULL)) {
-        TRADFRILOG(LOG_ERR, "tradfrimqtt cannot store coaps key\n");
-    }
-    
-    coap_register_option(ctx, COAP_OPTION_BLOCK2);
-    coap_register_response_handler(ctx, message_handler);
-    
+    /* Start MQTT connection */
     if(clientid != NULL && brokerurl != NULL){
         m = mqtt_init(&info, clientid, brokerurl, mqttport);
     }
     
-    /* Discover devices and groups from gateway */
-    check_gateway();  
-    
-    /* Read each device to populate read-once details and current values */
-    struct device *devicewalk = devicehead;
-    while(devicewalk != NULL){
-        update_device(devicewalk);
-        devicewalk = devicewalk->next;
-    }
-    
-    /* Read each group to populate read-once details and current values */
-    struct group *groupwalk = grouphead;
-    while(groupwalk != NULL){
-        update_group(groupwalk);
-        groupwalk = groupwalk->next;
-    }
-    
-    /* Holder for current time */
-    struct timespec thistime;
-    int pollcount = 0;
-    
-    clock_gettime(CLOCK_REALTIME, &thistime);
-    
-    struct timespec nextpolltime;
-    /* Timeout @ GATEWAY_POLLTIME_S seconds from last poll */
-    nextpolltime.tv_sec = thistime.tv_sec + GATEWAY_POLLTIME_S;
-    nextpolltime.tv_nsec = thistime.tv_nsec;
-        
-    /* Main polling loop controlled by timer and semaphore */
+    /* CoAP loop handling context reset.
+     * IKEA periodically update the gateway software and a reset of the CoAP context is required when this happens */   
     while(1){
+        TRADFRILOG(LOG_TRC, "Initialise CoAP context\n");
+        numfails = 0;
         
-        /* Wait on semaphore or timeout */
-        sem_timedwait(&poll_sem, &nextpolltime);
-        
-        /* Obtain the current time */
-        clock_gettime(CLOCK_REALTIME, &thistime);
-        
-        /* Push updates from mqtt to coap */
-        rundeviceupdate();
-        
-        /* Only poll the tradfri gateway every GATEWAY_POLLTIME_S seconds */
-        if(thistime.tv_sec > nextpolltime.tv_sec || (thistime.tv_sec == nextpolltime.tv_sec && thistime.tv_nsec >= nextpolltime.tv_nsec)){
-            
-            TRADFRILOG(LOG_TRC, "Runpoll\n");
-            
-            if(pollcount >= GATEWAY_SCAN_POLLS){
-                pollcount = 0;
-                check_gateway();
-            }
-            
-            /* Read each device and check for changes */
-            devicewalk = devicehead;
-            while(devicewalk != NULL){
-                update_device(devicewalk);
-                devicewalk = devicewalk->next;
-            }
-            /* Read each group and check for changes */
-            groupwalk = grouphead;
-            while(groupwalk != NULL){
-                update_group(groupwalk);
-                groupwalk = groupwalk->next;
-            }
-            rundevicereport();
-            
-            /* Timeout @ GATEWAY_POLLTIME_S seconds from last poll */
-            nextpolltime.tv_sec = thistime.tv_sec + GATEWAY_POLLTIME_S;
-            nextpolltime.tv_nsec = thistime.tv_nsec;
+        /* Create CoAP context */
+        switch (dst.addr.sa.sa_family) {
+        case AF_INET:
+//        addrptr = &dst.addr.sin.sin_addr;
+
+            /* create context for IPv4 */
+            ctx = get_context("0.0.0.0", "0", 1);
+            break;
+        case AF_INET6:
+//        addrptr = &dst.addr.sin6.sin6_addr;
+
+            /* create context for IPv6 */
+            ctx = get_context("::", "0", 1);
+            break;
+        default:
+            ;
         }
-    }
+
+        if (!ctx) {
+            TRADFRILOG(LOG_ERR, "cannot create tradfri COAP context\n");
+            exit(-1);
+        }
     
-    coap_free_context(ctx);  
+        coap_keystore_item_t *psk;
+        psk = coap_keystore_new_psk(NULL, 0, user, (size_t)userlen, key, (size_t)keylen, 0);
+        if (!psk || !coap_keystore_store_item(ctx->keystore, psk, NULL)) {
+            TRADFRILOG(LOG_ERR, "tradfrimqtt cannot store coaps key\n");
+        }
+    
+        coap_register_option(ctx, COAP_OPTION_BLOCK2);
+        coap_register_response_handler(ctx, message_handler);
+    
+        /* Discover devices and groups from gateway */
+        check_gateway();  
+    
+        /* Read each device to populate read-once details and current values */
+        struct device *devicewalk = devicehead;
+        while(devicewalk != NULL){
+            update_device(devicewalk);
+            devicewalk = devicewalk->next;
+        }
+    
+        /* Read each group to populate read-once details and current values */
+        struct group *groupwalk = grouphead;
+        while(groupwalk != NULL){
+            update_group(groupwalk);
+            groupwalk = groupwalk->next;
+        }
+    
+        /* Holder for current time */
+        struct timespec thistime;
+        int pollcount = 0;
+    
+        clock_gettime(CLOCK_REALTIME, &thistime);
+    
+        struct timespec nextpolltime;
+        /* Timeout @ GATEWAY_POLLTIME_S seconds from last poll */
+        nextpolltime.tv_sec = thistime.tv_sec + GATEWAY_POLLTIME_S;
+        nextpolltime.tv_nsec = thistime.tv_nsec;
+        
+        /* Main polling loop controlled by timer and semaphore */
+        while(1){
+        
+            /* Wait on semaphore or timeout */
+            sem_timedwait(&poll_sem, &nextpolltime);
+        
+            /* Obtain the current time */
+            clock_gettime(CLOCK_REALTIME, &thistime);
+        
+            /* Push updates from mqtt to coap */
+            rundeviceupdate();
+        
+            /* Only poll the tradfri gateway every GATEWAY_POLLTIME_S seconds */
+            if(thistime.tv_sec > nextpolltime.tv_sec || (thistime.tv_sec == nextpolltime.tv_sec && thistime.tv_nsec >= nextpolltime.tv_nsec)){
+            
+                TRADFRILOG(LOG_TRC, "Runpoll\n");
+            
+                if(++pollcount >= GATEWAY_SCAN_POLLS){
+                    pollcount = 0;
+                    TRADFRILOG(LOG_TRC, "Inspect gateway devices\n");
+                    /* Check all devices on the gateway. If an error occurs reset the CoAP context and restart polling */
+                    if(0 != check_gateway())
+                        break;
+                }
+            
+                /* Read each device and check for changes */
+                devicewalk = devicehead;
+                while(devicewalk != NULL && numfails < 5){
+                    update_device(devicewalk);
+                    devicewalk = devicewalk->next;
+                }
+                /* Read each group and check for changes */
+                groupwalk = grouphead;
+                while(groupwalk != NULL && numfails < 5){
+                    update_group(groupwalk);
+                    groupwalk = groupwalk->next;
+                }
+                if(numfails < 5)
+                    rundevicereport();
+            
+                /* Timeout @ GATEWAY_POLLTIME_S seconds from last poll */
+                nextpolltime.tv_sec = thistime.tv_sec + GATEWAY_POLLTIME_S;
+                nextpolltime.tv_nsec = thistime.tv_nsec;
+            }
+            if(numfails >= 5)
+                break;
+        }
+        TRADFRILOG(LOG_ERR, "Polling errors occurred - reconnecting with gateway\n");
+        coap_free_context(ctx);
+        ctx = NULL;
+    }
     return 0;
 }
 
