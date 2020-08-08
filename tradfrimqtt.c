@@ -43,7 +43,7 @@
 
 /* Defaults */
 
-#define APP_VERSION "0.95"
+#define APP_VERSION "0.97"
 
 #define DEFAULT_MQTT_START_DELAY 5 /* 5 second delay to allow broker to start */
 
@@ -55,6 +55,7 @@
 #define DEFAULT_TRADFRI_BASE_TOPIC       "tradfri/"   /* Default mqtt topic prefix if not overridden by arg */
 #define TRADFRI_STATUS_TOPIC             "status/"     /* Status topic section for mqtt publish e.g. (tradfri/status/<device>....) */
 #define TRADFRI_SET_TOPIC                "set/"        /* Set topic section for mqtt subscribe e.g. (tradfri/set/<device>....) */
+#define TRADFRI_GET_TOPIC                "get/"        /* Get topic for mqtt subscribe */
 
 /* MQTT Globals */
 
@@ -78,6 +79,7 @@ static struct mosquitto *mqtt_init(struct client_info *info, const char *clienti
 const char defaultbasetopic[]    = DEFAULT_TRADFRI_BASE_TOPIC;
 const char statussubtopic[]      = TRADFRI_STATUS_TOPIC;
 const char setsubtopic[]         = TRADFRI_SET_TOPIC;
+const char getsubtopic[]         = TRADFRI_GET_TOPIC;
 
 char *basetopic = (char *)defaultbasetopic; /* Start with the default base topic (this can be changed by cmdline args) */
 
@@ -699,7 +701,7 @@ int coap_execute(method_t m, const char *path, char *payload, char **resp){
 
 #define SET_BULB_DIMMER   "{ \"3311\": [{ \"5851\": %d, \"5712\": 10 }] }"
 #define SET_BULB_POWER    "{ \"3311\": [{ \"5850\": %d }] }"
-#define SET_BULB_TEMP     "{ \"3311\" : [{ \"5709\" : %d, \"5710\": %d, \"5712\": 10 }] }"
+#define SET_BULB_TEMP     "{ \"3311\": [{ \"5709\" : %d, \"5710\": %d, \"5712\": 10 }] }"
 //#define SET_TEMP   "{ \"3311\" : [{ \"5711\": %d, \"5712\": 10 }] }"
 #define CONVERTTEMP_PC_TO_X(pc)    (24930 + (int)(82.05 * (float)pc))               /* 24930 - 33135 */  /* 0x6162 - 0x816f */
 #define CONVERTTEMP_PC_TO_Y(pc)    (24694 + (int)(25.17 * (float)(100 - pc)))       /* 24694 - 27211 */ /* 0x6076 - 0x6a4b */
@@ -707,27 +709,35 @@ int coap_execute(method_t m, const char *path, char *payload, char **resp){
 
 #define SET_OUTLET_POWER  "{ \"3312\": [{ \"5850\": %d }] }"
 
+#define SET_BLIND_HEIGHT  "{ \"15015\": [{ \"5536\": %.1f }] }"
+#define SET_BLIND_TRIGGER "{ \"15015\": [{ \"5523\": %.1f }] }"
+
 #define SET_GROUP_DIMMER  "{ \"5851\": %d, \"5712\": 10 }"
 #define SET_GROUP_POWER   "{ \"5850\": %d }"
 
 /* Add new device types here */
-enum _devicetype{DEVICE_TYPE_UNKNOWN = 0, DEVICE_TYPE_BULB, DEVICE_TYPE_DIMMER, DEVICE_TYPE_OUTLET};
+enum _devicetype{DEVICE_TYPE_UNKNOWN = 0, DEVICE_TYPE_BULB, DEVICE_TYPE_DIMMER, DEVICE_TYPE_OUTLET, DEVICE_TYPE_BLIND};
 
 /* Command types for devices */
-enum _tradfri_cmd {COMMAND_NONE = 0, COMMAND_POWER, COMMAND_BRIGHTNESS, COMMAND_COLOURTEMP, COMMAND_RGB};
+enum _tradfri_cmd {COMMAND_NONE = 0, COMMAND_POWER, COMMAND_BRIGHTNESS, COMMAND_COLOURTEMP, COMMAND_RGB, COMMAND_HEIGHT};
 
 /* Device structure - one entry per device */
 struct device {
-     int id;
-     char *name;
-     bool report;
-     bool removed;
-     enum _devicetype type; 
-     void *typedata;
-     struct device *next;
+    int id;
+    char *name;
+    bool report;
+    bool removed;
+    bool batterypowered;
+    int batterylevel;
+    bool batterylow;
+    bool reportbatterylevel;
+    enum _devicetype type; 
+    void *typedata;
+    struct device *next;
 };
 
-#define NOCHANGE -1
+#define NOCHANGE       -1
+#define NOCHANGE_FLOAT -1.0
 
 /* Bulb type structure - one per bulb device */
 struct bulb {
@@ -754,9 +764,14 @@ struct outlet {
     bool poweron;
     int desiredpower;
     bool reportpower;
-    //int brightness;
-    //int desiredbrightness;
-    //bool reportbrightness;
+    struct device *parent;
+};
+
+/* Blind struct */
+struct blind {
+    float height;
+    float desiredheight;
+    bool reportheight;
     struct device *parent;
 };
 
@@ -798,6 +813,10 @@ static int newdevice(int id){
         newdevice->typedata = NULL;
         newdevice->report = false;
         newdevice->removed = false;
+        newdevice->batterypowered = false;
+        newdevice->batterylevel = 0;
+        newdevice->batterylow = false;
+        newdevice->reportbatterylevel = false;
         newdevice->next = NULL;
         if(devicehead == NULL){
             devicehead = newdevice;
@@ -894,6 +913,7 @@ static int deletegroup(struct group *grp){
 static int update_device(struct device *thisdevice){
     char *output = NULL;
     int res, reportedid = 0;
+    int batterylevel = -1;
     char path[200];
     
     sprintf(path, "15001/%d", thisdevice->id);
@@ -912,27 +932,47 @@ static int update_device(struct device *thisdevice){
         }
         /* If the ids match we've got the right device */
         if(reportedid == thisdevice->id){
-            if(thisdevice->name == NULL){
-                /* 9001 is the name */
-                if(json_object_object_get_ex(jobj, "9001", &jparse)){
-                    name = json_object_get_string(jparse);
+            /* 9001 is the name */
+            if(json_object_object_get_ex(jobj, "9001", &jparse)){
+                name = json_object_get_string(jparse);
+                if(thisdevice->name == NULL){
                     TRADFRILOG(LOG_CHANGE, "Device name %s\n", name);
                     thisdevice->name = strdup(name);
+                    /* 3 is the device details */
+                    if(json_object_object_get_ex(jobj, "3", &jparse)){
+                        /* Read the device description and display it */
+                        if(json_object_object_get_ex(jparse, "1", &jsubparse)){
+                            name = json_object_get_string(jsubparse);
+                            TRADFRILOG(LOG_CHANGE, "Device %s is a %s\n", thisdevice->name, name);
+                        }
+                        /* "6" is power supply (1=mains, 3=battery) */
+                        if(json_object_object_get_ex(jparse, "6", &jsubparse)){
+                            if(3 == json_object_get_int(jsubparse)){
+                                TRADFRILOG(LOG_TRC, "Device %s is battery powered\n", thisdevice->name);
+                                thisdevice->batterypowered = true;
+                            }
+                        }
+                    }
+                    thisdevice->report = true;
+                }else if(strcmp(name, thisdevice->name) != 0){
+                    TRADFRILOG(LOG_CHANGE, "Device %s(%d) changed its name to %s\n", thisdevice->name, thisdevice->id, name);
+                    free(thisdevice->name);
+                    thisdevice->name = strdup(name);
+                    thisdevice->report = true;
                 }
-                /* 3 is the device details */
+            }
+            
+            /* For battery powered devices check the battery level */
+            if(thisdevice->batterypowered == true){
                 if(json_object_object_get_ex(jobj, "3", &jparse)){
-                    //if(json_object_object_get_ex(jparse, "6", &jsubparse)){
-                    //    thisdevice->type = param6type[json_object_get_int(jsubparse)];
-                    //    TRADFRILOG(LOG_CHANGE, "Device type is %s\n", param6descr[thisdevice->type]);
-                    //}
-                    if(json_object_object_get_ex(jparse, "1", &jsubparse)){
-                        name = json_object_get_string(jsubparse);
-                        TRADFRILOG(LOG_CHANGE, "Device is %s\n", name);
+                    if(json_object_object_get_ex(jparse, "9", &jsubparse)){
+                        batterylevel = json_object_get_int(jsubparse);
                     }
                 }
-                thisdevice->report = true;
             }
+            
             if(json_object_object_get_ex(jobj, "3312", &jparse)){
+                /* 3312 indicates this device is a switchable power outlet */
                 bool addingoutlet = false;
                 if(thisdevice->typedata == NULL){
                     struct outlet *newoutlet = malloc(sizeof(struct outlet));
@@ -945,9 +985,6 @@ static int update_device(struct device *thisdevice){
                         newoutlet->poweron = false;
                         newoutlet->reportpower = false;
                         newoutlet->desiredpower = NOCHANGE;
-                        //newoutlet->brightness = 0;
-                        //newoutlet->reportbrightness = false;
-                        //newoutlet->desiredbrightness = NOCHANGE;
                         thisdevice->typedata = newoutlet;
                     }
                 }
@@ -968,18 +1005,6 @@ static int update_device(struct device *thisdevice){
                             if(addingoutlet == true)
                                 TRADFRILOG(LOG_TRC, "%s poweronstate is %s\n", thisoutlet->parent->name, thisoutlet->poweron ? "on" : "off");
                         }
-                        /* 5851 is the brightness (0-254) */
-                        //if(json_object_object_get_ex(jarrparse, "5851", &jsubparse)){
-                        //    /* Brightness */
-                        //    int brightness = json_object_get_int(jsubparse);
-                        //    if(thisoutlet->brightness != brightness){
-                        //        TRADFRILOG(LOG_CHANGE, "%s brightness changed from %d to %d\n", thisoutlet->parent->name, thisoutlet->brightness, brightness);
-                        //        thisoutlet->brightness = brightness;
-                        //        thisoutlet->reportbrightness = true;
-                        //    }
-                        //    if(addingoutlet == true)
-                        //        TRADFRILOG(LOG_TRC, "%s brightness is %d\n", thisoutlet->parent->name, thisoutlet->brightness);
-                        //}
                     //}
                     /* 9019 is the mains power state for the bulb */
                     if(json_object_object_get_ex(jobj, "9019", &jparse)){
@@ -993,7 +1018,38 @@ static int update_device(struct device *thisdevice){
                             TRADFRILOG(LOG_TRC, "%s mains power is %s\n", thisoutlet->parent->name, thisoutlet->mainson ? "on" : "off");
                     }
                 }
+            }else if(json_object_object_get_ex(jobj, "15015", &jparse)){
+                /* 15015 is a window-blind */
+                bool addingblind = false;
+                if(thisdevice->typedata == NULL){
+                    struct blind *newblind = malloc(sizeof(struct blind));
+                    if(newblind != NULL){
+                        thisdevice->type = DEVICE_TYPE_BLIND;
+                        addingblind = true;
+                        newblind->parent = thisdevice;
+                        newblind->height = 0.0;
+                        newblind->reportheight = false;
+                        newblind->desiredheight = NOCHANGE_FLOAT;
+                        thisdevice->typedata = newblind;
+                    }
+                }
+                struct blind *thisblind = (struct blind *)(thisdevice->typedata);
+                if(thisblind != NULL){
+                    jarrparse = json_object_array_get_idx(jparse, 0);
+                    /* 5536 is the height */
+                    if(json_object_object_get_ex(jarrparse, "5536", &jsubparse)){
+                        float height = (float)json_object_get_double(jsubparse);
+                        if(thisblind->height != height){
+                            TRADFRILOG(LOG_CHANGE, "%s height changed from %.1f to %.1f\n", thisblind->parent->name, thisblind->height, height);
+                            thisblind->height = height;
+                            thisblind->reportheight = true;
+                        }
+                        if(addingblind == true)
+                            TRADFRILOG(LOG_TRC, "%s height is %.1f\n", thisblind->parent->name, thisblind->height);
+                    }
+                }
             }else if(json_object_object_get_ex(jobj, "3311", &jparse)){
+                /* 3311 is a lightbulb */
                 bool addingbulb = false;
                 if(thisdevice->typedata == NULL){
                     struct bulb *newbulb = malloc(sizeof(struct bulb));
@@ -1018,10 +1074,7 @@ static int update_device(struct device *thisdevice){
                     }
                 }
                 struct bulb *thisbulb = (struct bulb *)(thisdevice->typedata);
-                if(thisbulb != NULL){
-                    /* 3311 is an array of settings */
-                    //if(json_object_object_get_ex(jobj, "3311", &jparse)){
-              
+                if(thisbulb != NULL){              
                     jarrparse = json_object_array_get_idx(jparse, 0);
                     /* 5709 is the colour */
                     if(json_object_object_get_ex(jarrparse, "5709", &jsubparse)){
@@ -1060,7 +1113,6 @@ static int update_device(struct device *thisdevice){
                         if(addingbulb == true)
                             TRADFRILOG(LOG_TRC, "%s brightness is %d\n", thisbulb->parent->name, thisbulb->brightness);
                     }
-                    //}
                     /* 9019 is the mains power state for the bulb */
                     if(json_object_object_get_ex(jobj, "9019", &jparse)){
                         int mainson = json_object_get_int(jparse);
@@ -1074,7 +1126,26 @@ static int update_device(struct device *thisdevice){
                     }
                 }
             }else{
+                /* Some unrecognised device - we cannot control it but we can monitor its battery level if it is battery powered */
                 TRADFRILOG(LOG_DBG, "%s is not a controllable tradfri device\n", thisdevice->name);
+            }
+            /* If this device is battery powered we can report the battery state even if it contains nothing controllable */
+            if(thisdevice->batterypowered == true && batterylevel >= 0){
+                int levdiff = abs(thisdevice->batterylevel - batterylevel);
+                bool newbattlow = false;
+                bool reportbatt = false;
+                if(batterylevel <= 10)
+                    newbattlow = true;
+                else
+                    newbattlow = false;
+                if(levdiff > 5 || thisdevice->batterylow != newbattlow)
+                    reportbatt = true;
+                thisdevice->batterylow = newbattlow;
+                thisdevice->batterylevel = batterylevel;
+                if(reportbatt == true){
+                    thisdevice->reportbatterylevel = true;
+                    TRADFRILOG(LOG_CHANGE, "%s battery level changed to %d%% - %s\n", thisdevice->name, thisdevice->batterylevel, thisdevice->batterylow == true ? "LOW" : "OK");
+                }
             }
         }else{
             TRADFRILOG(LOG_ERR, "Error wrong device (%d) returned when polling %d\n", reportedid, thisdevice->id);
@@ -1132,13 +1203,17 @@ static int command_device(struct device *dev, enum _tradfri_cmd command, char *p
                 ((struct outlet *)(dev->typedata))->desiredpower = (rq > 0) ? 1 : 0;
                 rc = 0;
                 break;
-            //case COMMAND_BRIGHTNESS:
-            //    TRADFRILOG(LOG_CHANGE, "Set %s brightness to %s\n", dev->name, param);
-            //    float mult = (float)rq * 2.54;
-            //    rq = (int)mult;
-            //    ((struct outlet *)(dev->typedata))->desiredbrightness = rq;
-            //    rc = 0;
-            //    break;
+            default:
+                break;
+        }
+    }else if(dev->type == DEVICE_TYPE_BLIND){
+        float rq = strtof(param, NULL);
+        switch(command){
+            case COMMAND_HEIGHT:
+                TRADFRILOG(LOG_CHANGE, "Set %s height to %s (%.1f)\n", dev->name, param, rq);
+                ((struct blind *)(dev->typedata))->desiredheight = rq;
+                rc = 0;
+                break;
             default:
                 break;
         }
@@ -1205,7 +1280,7 @@ static int update_group(struct group *thisgroup){
     char path[200];
     
     sprintf(path, "15004/%d", thisgroup->id);
-    TRADFRILOG(LOG_DBG, "Get device details for %s\n", path);
+    TRADFRILOG(LOG_DBG, "Get group details for %s\n", path);
     res = coap_execute(COAP_REQUEST_GET, path, NULL, &output);
     if(res == 0 && output != NULL){
         TRADFRILOG(LOG_DBG, "Group %d details %s\n", thisgroup->id, output);
@@ -1220,48 +1295,53 @@ static int update_group(struct group *thisgroup){
         }
         /* If the ids match we've got the right group */
         if(reportedid == thisgroup->id){
-            if(thisgroup->name == NULL){
-                /* 9001 is the name */
-                if(json_object_object_get_ex(jobj, "9001", &jparse)){
-                    name = json_object_get_string(jparse);
+            /* 9001 is the name */
+            if(json_object_object_get_ex(jobj, "9001", &jparse)){
+                name = json_object_get_string(jparse);
+                if(thisgroup->name == NULL){
                     TRADFRILOG(LOG_TRC, "Group name is %s\n", name);
                     thisgroup->name = strdup(name);
-                }
-                if(json_object_object_get_ex(jobj, "5850", &jparse)){
-                    int power = json_object_get_int(jparse);
-                    TRADFRILOG(LOG_TRC, "Group power is %s\n", power == 0 ? "off" : "on");
-                    thisgroup->poweron = (power == 0 ? false : true);
-                }
-                if(json_object_object_get_ex(jobj, "5851", &jparse)){
-                    int bright = json_object_get_int(jparse);
-                    TRADFRILOG(LOG_TRC, "Group brightness is is %d\n", bright);
-                    thisgroup->brightness = bright;
-                }
-                /* Get list of devices and reference them in the group struct */
-                if(json_object_object_get_ex(jobj, "9018", &jparse)){
-                    json_object *jparse2;
-                    if(json_object_object_get_ex(jparse, "15002", &jparse2)){
-                        json_object *jparse3;
-                        if(json_object_object_get_ex(jparse2, "9003", &jparse3)){
-                            int devidx = 0, numdevs, devid;
-                            numdevs = json_object_array_length(jparse3);
+                
+                    if(json_object_object_get_ex(jobj, "5850", &jparse)){
+                        int power = json_object_get_int(jparse);
+                        TRADFRILOG(LOG_TRC, "Group power is %s\n", power == 0 ? "off" : "on");
+                        thisgroup->poweron = (power == 0 ? false : true);
+                    }
+                    if(json_object_object_get_ex(jobj, "5851", &jparse)){
+                        int bright = json_object_get_int(jparse);
+                        TRADFRILOG(LOG_TRC, "Group brightness is %d\n", bright);
+                        thisgroup->brightness = bright;
+                    }
+                    /* Get list of devices and reference them in the group struct */
+                    if(json_object_object_get_ex(jobj, "9018", &jparse)){
+                        json_object *jparse2;
+                        if(json_object_object_get_ex(jparse, "15002", &jparse2)){
+                            json_object *jparse3;
+                            if(json_object_object_get_ex(jparse2, "9003", &jparse3)){
+                                int devidx = 0, numdevs, devid;
+                                numdevs = json_object_array_length(jparse3);
                     
-                            thisgroup->devices = malloc(sizeof(struct grp_devlist) + (sizeof(struct device *) * numdevs));
-                            if(thisgroup->devices != NULL){
-                                TRADFRILOG(LOG_DBG, "This group contains:\n");
-                                thisgroup->devices->numdevs = numdevs;
-                                for(devidx =0; devidx < numdevs; devidx++){
-                                    jarrparse = json_object_array_get_idx(jparse3, devidx);
-                                    if(jarrparse == NULL)
-                                        break;
-                                    devid = json_object_get_int(jarrparse);
-                                    thisgroup->devices->dev[devidx] = finddevid(devid);
-                                    if(thisgroup->devices->dev[devidx] != NULL)
-                                        TRADFRILOG(LOG_DBG, "Device %s\n", thisgroup->devices->dev[devidx]->name);
+                                thisgroup->devices = malloc(sizeof(struct grp_devlist) + (sizeof(struct device *) * numdevs));
+                                if(thisgroup->devices != NULL){
+                                    TRADFRILOG(LOG_DBG, "This group contains:\n");
+                                    thisgroup->devices->numdevs = numdevs;
+                                    for(devidx =0; devidx < numdevs; devidx++){
+                                        jarrparse = json_object_array_get_idx(jparse3, devidx);
+                                        if(jarrparse == NULL)
+                                            break;
+                                        devid = json_object_get_int(jarrparse);
+                                        thisgroup->devices->dev[devidx] = finddevid(devid);
+                                        if(thisgroup->devices->dev[devidx] != NULL)
+                                            TRADFRILOG(LOG_DBG, "Device %s\n", thisgroup->devices->dev[devidx]->name);
+                                    }
                                 }
                             }
                         }
                     }
+                }else if(strcmp(thisgroup->name, name) != 0){
+                    TRADFRILOG(LOG_CHANGE, "Group %s (%d) has changed its name to %s\n", thisgroup->name, thisgroup->id, name);
+                    free(thisgroup->name);
+                    thisgroup->name = strdup(name);
                 }
             }
         }else{
@@ -1269,12 +1349,13 @@ static int update_group(struct group *thisgroup){
         }
         json_object_put(jobj);
     }else{
+        numfails++;
         TRADFRILOG(LOG_ERR, "Unable to update group %s\n", thisgroup->name);
     }
     if(output != NULL){
         free(output);
     }
-    return 0;
+    return res;
 }
 
 /* Send a command to all devices in a group */
@@ -1337,7 +1418,6 @@ static int rundeviceupdate(void){
     char *output = NULL;
     int rc = 0;
     while(thisdev != NULL){
-        
         switch(thisdev->type){
             case DEVICE_TYPE_BULB:
             {
@@ -1404,6 +1484,23 @@ static int rundeviceupdate(void){
                 }
             }
             break;
+            case DEVICE_TYPE_BLIND:
+            {
+                struct blind *thisblind = (struct blind *)(thisdev->typedata);
+                if(thisblind->desiredheight != NOCHANGE_FLOAT){
+                    sprintf(path, "15001/%d", thisdev->id);
+                    sprintf(payload, SET_BLIND_HEIGHT, thisblind->desiredheight);
+                    if(coap_execute(COAP_REQUEST_PUT, path, payload, &output) == 0){
+                        thisblind->desiredheight = NOCHANGE_FLOAT;
+                    }else{
+                        rc = 1;
+                        numfails++;
+                    }
+                    if(output != NULL)
+                        free(output);
+                }
+            }
+            break;
             default:
                 break;
         }
@@ -1412,11 +1509,56 @@ static int rundeviceupdate(void){
     return rc;
 }
 
+/* Request a publish of all device states */
+static int reportdevice(struct device *thisdev){
+    bool justone = false;
+    if(thisdev == NULL)
+        thisdev = devicehead;
+    else
+        justone = true;
+    while(thisdev != NULL){
+        switch(thisdev->type){
+            case DEVICE_TYPE_BULB:
+            {
+                struct bulb *thisbulb = (struct bulb *)(thisdev->typedata);
+                thisbulb->reportpower = true;
+                thisbulb->reportbrightness = true;
+                thisbulb->reportmainson = true;
+                if(thisbulb->iscolourtemp == true)
+                    thisbulb->reportcolour = true;
+            }
+            break;
+            case DEVICE_TYPE_OUTLET:
+            {
+                struct outlet *thisoutlet = (struct outlet *)(thisdev->typedata);
+                thisoutlet->reportpower = true;
+            }
+            break;
+            case DEVICE_TYPE_BLIND:
+            {
+                struct blind *thisblind = (struct blind *)(thisdev->typedata);
+                thisblind->reportheight = true;
+            }
+            break;
+            default:
+                break;
+        }
+        if(thisdev->batterypowered == true)
+            thisdev->reportbatterylevel = true;
+        if(justone == true)
+            break;
+        thisdev = thisdev->next;
+    }
+    return 0;
+}
+
+/* Report each device parameter to a topic including the id and also to a topic including the name.
+ * This means MQTT topics can be derived from the device names in the ikea app and the user
+ * doesn't need to discover the device IDs */
 static int rundevicereport(void){
     struct device *thisdev = devicehead;
-    //char topic[50];
-    char topic[sizeof(statussubtopic) + strlen(basetopic) + 20];
-    char message[10];
+    char topic[sizeof(statussubtopic) + strlen(basetopic) + strlen(thisdev->name) + 20];
+    char message[20];
     while(thisdev != NULL){
         switch(thisdev->type){
             case DEVICE_TYPE_BULB:
@@ -1428,7 +1570,7 @@ static int rundevicereport(void){
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
                     sprintf(topic, "%s%s%d/lamp", basetopic, statussubtopic, thisdev->id);
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
-                    TRADFRILOG(LOG_CHANGE, "%s light %s\n", thisdev->name, message);
+                    TRADFRILOG(LOG_CHANGE, "Send %s light %s\n", thisdev->name, message);
                     thisbulb->reportpower = false;
                 }
                 if(thisbulb->reportbrightness == true){
@@ -1438,7 +1580,7 @@ static int rundevicereport(void){
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
                     sprintf(topic, "%s%s%d/brightness", basetopic, statussubtopic, thisdev->id);
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
-                    TRADFRILOG(LOG_CHANGE, "%s brightness %s\n", thisdev->name, message);
+                    TRADFRILOG(LOG_CHANGE, "Send %s brightness %s\n", thisdev->name, message);
                     thisbulb->reportbrightness = false;
                 }
                 if(thisbulb->reportcolour == true){
@@ -1447,7 +1589,7 @@ static int rundevicereport(void){
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
                     sprintf(topic, "%s%s%d/temp", basetopic, statussubtopic, thisdev->id);
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
-                    TRADFRILOG(LOG_CHANGE, "%s colour temp %s\n", thisdev->name, message);
+                    TRADFRILOG(LOG_CHANGE, "Send %s colour temp %s\n", thisdev->name, message);
                     thisbulb->reportcolour = false;
                 }
                 if(thisbulb->reportmainson == true){
@@ -1456,7 +1598,7 @@ static int rundevicereport(void){
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
                     sprintf(topic, "%s%s%d/power", basetopic, statussubtopic, thisdev->id);
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
-                    TRADFRILOG(LOG_CHANGE, "%s mains %s\n", thisdev->name, message);
+                    TRADFRILOG(LOG_CHANGE, "Send %s mains %s\n", thisdev->name, message);
                     thisbulb->reportmainson = false;
                 }
             }
@@ -1470,7 +1612,7 @@ static int rundevicereport(void){
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
                     sprintf(topic, "%s%s%d/power", basetopic, statussubtopic, thisdev->id);
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
-                    TRADFRILOG(LOG_CHANGE, "%s outlet %s\n", thisdev->name, message);
+                    TRADFRILOG(LOG_CHANGE, "Send %s outlet %s\n", thisdev->name, message);
                     thisoutlet->reportpower = false;
                 }
                 if(thisoutlet->reportmainson == true){
@@ -1479,13 +1621,44 @@ static int rundevicereport(void){
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
                     sprintf(topic, "%s%s%d/mains", basetopic, statussubtopic, thisdev->id);
                     mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
-                    TRADFRILOG(LOG_CHANGE, "%s mains %s\n", thisdev->name, message);
+                    TRADFRILOG(LOG_CHANGE, "Send %s mains %s\n", thisdev->name, message);
                     thisoutlet->reportmainson = false;
+                }
+            }
+            break;
+            case DEVICE_TYPE_BLIND:
+            {
+                struct blind *thisblind = (struct blind *)(thisdev->typedata);
+                /* Report the blind height */
+                if(thisblind->reportheight == true){
+                    sprintf(message, "%.1f", thisblind->height);
+                    sprintf(topic, "%s%s%s/level", basetopic, statussubtopic, thisdev->name);
+                    mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
+                    sprintf(topic, "%s%s%d/level", basetopic, statussubtopic, thisdev->id);
+                    mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
+                    TRADFRILOG(LOG_CHANGE, "Send %s level %s\n", thisdev->name, message);
+                    thisblind->reportheight = false;
                 }
             }
             break;
             default:
                 break;
+        }
+        /* Report the battery level and low boolean of any battery powered devices */
+        if(thisdev->reportbatterylevel == true){
+            sprintf(message, "%d", thisdev->batterylevel);
+            sprintf(topic, "%s%s%s/battery", basetopic, statussubtopic, thisdev->name);
+            mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
+            sprintf(topic, "%s%s%d/battery", basetopic, statussubtopic, thisdev->id);
+            mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
+            TRADFRILOG(LOG_CHANGE, "Send %s battery %s\n", thisdev->name, message);
+            sprintf(message, "%s", thisdev->batterylow == true ? "true" : "false");
+            sprintf(topic, "%s%s%s/batterylow", basetopic, statussubtopic, thisdev->name);
+            mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
+            sprintf(topic, "%s%s%d/batterylow", basetopic, statussubtopic, thisdev->id);
+            mosquitto_publish(m, NULL, topic, strlen(message), message, 0, true);
+            TRADFRILOG(LOG_CHANGE, "Send %s batterylow %s\n", thisdev->name, message);
+            thisdev->reportbatterylevel = false;
         }
         thisdev = thisdev->next;
     }
@@ -1826,9 +1999,10 @@ int main(int argc, char **argv){
 //#define LIGHTCONTROL 0
 //#define OTHERCONTROL 1
 
-#define CONTROL 0
+#define CONTROL      0
+#define CONTROL_GET  1
 
-#define NUMCONTROLS  1
+#define NUMCONTROLS  2
 
 char *subtopic[NUMCONTROLS];
 int submid[NUMCONTROLS];
@@ -1837,6 +2011,8 @@ static void create_subtopics(void){
     subtopic[CONTROL] = malloc(strlen(basetopic) + sizeof(setsubtopic) + 2);
     /* TODO check for NULL return */
     sprintf(subtopic[CONTROL], "%s%s#", basetopic, setsubtopic);
+    subtopic[CONTROL_GET] = malloc(strlen(basetopic) + sizeof(getsubtopic) + 2);
+    sprintf(subtopic[CONTROL_GET], "%s%s#", basetopic, getsubtopic);
 }
     
 /* Callback for successful connection: add subscriptions. */
@@ -1847,6 +2023,8 @@ static void on_connect(struct mosquitto *m, void *udata, int res) {
         
         TRADFRILOG(LOG_TRC, "Subscribing to %s\n", subtopic[CONTROL]);
         mosquitto_subscribe(m, &submid[CONTROL], subtopic[CONTROL], 0);
+        TRADFRILOG(LOG_TRC, "Subscribing to %s\n", subtopic[CONTROL_GET]);
+        mosquitto_subscribe(m, &submid[CONTROL_GET], subtopic[CONTROL_GET], 0);
         
     } else {
         TRADFRILOG(LOG_ERR, "MQTT connection refused\n");
@@ -1869,13 +2047,15 @@ static void on_message(struct mosquitto *m, void *udata, const struct mosquitto_
     //payload:
     //value
     
-    int settopiclen = strlen(subtopic[CONTROL]) - 1; /* subtopics always have a wildcard '#' at the end so remove that */
+    int topiclen; 
+    
     char *payload = malloc(msg->payloadlen + 1);
     if(payload != NULL)
         snprintf(payload, msg->payloadlen + 1, "%s", (char *)msg->payload);
     
-    if(strncmp(msg->topic, subtopic[CONTROL], settopiclen) == 0){
-        char *devaddr = &msg->topic[settopiclen];
+    topiclen = strlen(subtopic[CONTROL]) - 1; /* subtopics always have a wildcard '#' at the end so remove that */
+    if(strncmp(msg->topic, subtopic[CONTROL], topiclen) == 0){
+        char *devaddr = &msg->topic[topiclen];
         if(devaddr != NULL){
             char *cmd = strchr(devaddr, '/');
             int devidlen = cmd - devaddr;
@@ -1894,6 +2074,8 @@ static void on_message(struct mosquitto *m, void *udata, const struct mosquitto_
                     command = COMMAND_POWER;
                 }else if(strncmp(cmd, "temp", 4) == 0){
                     command = COMMAND_COLOURTEMP;
+                }else if(strncmp(cmd, "level", 5) == 0){
+                    command = COMMAND_HEIGHT;
                 }
                 if(command == COMMAND_NONE)
                     return;
@@ -1909,8 +2091,25 @@ static void on_message(struct mosquitto *m, void *udata, const struct mosquitto_
                         command_device(devset, command, payload);
                     }
                 }
-                
                 free(devid);
+            }
+        }
+    }
+    
+    topiclen = strlen(subtopic[CONTROL_GET]) - 1; /* subtopics always have a wildcard '#' at the end so remove that */
+    if(strncmp(msg->topic, subtopic[CONTROL_GET], topiclen) == 0){
+        char *devaddr = &msg->topic[topiclen];
+        if(*devaddr != 0){
+            if(strcmp(devaddr, "all") != 0){
+                struct device *devget = finddevice(devaddr);
+                if(devget != NULL){
+                    TRADFRILOG(LOG_TRC, "Report requested for %s\n", devget->name);
+                    reportdevice(devget);
+                }
+            }else{
+                /* If we have been requested to resend all details */
+                TRADFRILOG(LOG_TRC, "Full report requested\n");
+                reportdevice(NULL);
             }
         }
     }
@@ -1927,7 +2126,9 @@ static void on_subscribe(struct mosquitto *m, void *udata, int mid, int qos_coun
     /* Match mid to subrq */
     
     if(submid[CONTROL] == mid)
-        TRADFRILOG(LOG_TRC, "Subscribed\n");
+        TRADFRILOG(LOG_TRC, "Subscribed to set topic\n");
+    else if(submid[CONTROL_GET] == mid)
+        TRADFRILOG(LOG_TRC, "Subscribed to get topic\n");
     else
         TRADFRILOG(LOG_ERR, "Unknown subscription\n");
     
