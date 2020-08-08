@@ -3,16 +3,12 @@ c implementation of coap to mqtt daemon to control IKEA tradfri devices
 
 ## What's it for?
 Enable control of tradfri lighting, outlets and blinds via the tradfri gateway using CoAP.  
-The daemon uses the mosquitto mqtt client library to subscribe to settings topics and publishes device status when changes occur.  
+The daemon uses the mosquitto mqtt client library to subscribe to settings topics and publishes device status when  
+changes occur.  
 
 ## Why a daemon written in c rather than Python?
-Many Tradfri connection applications or home-automation bindings utilise coap-client as their mechanism to communicate with  
-the tradfri gateway. Each time coap-client is used to read or set tradfri parameters a DTLS session is created and a single  
-coap poll is actioned. In my experience repeated connections using this mechanism can cause the tradfri gateway to stop  
-responding and occasionally reset.  
-I wrote this daemon in c (derived from coap-client) to use libcoap and hold a single connection context to the gateway for  
-all polls/commands. It is very stable even when polling large numbers of devices repeatedly. This in turn means that tradfri  
-devices controlled using their own remote control devices can rapidly update their current status via mqtt publish messages.  
+Many Tradfri connection applications or home-automation bindings utilise coap-client as their mechanism to communicate with the tradfri gateway. Each time coap-client is used to read or set tradfri parameters a DTLS session is created and a single coap poll is actioned. In my experience repeated connections using this mechanism can cause the tradfri gateway to stop responding and occasionally reset.  
+I wrote this daemon in c (derived from coap-client) to use libcoap and hold a single connection context to the gateway for all polls/commands. It is very stable even when polling large numbers of devices repeatedly. This in turn means that tradfri devices controlled using their own remote control devices can rapidly update their current status via mqtt publish messages.  
 
 ## Testing
 This has been tested with my tradfri gateway with 16 bulbs, two fyrtur blinds and an outlet all controlled via mqtt from openhab.  
@@ -40,11 +36,9 @@ options:
 All devices are polled every 10 seconds and changes to any parameters are published. This keeps track of any changes from dimmers/tradfri app.
 The gateway device list is polled every 15 minutes to discover new devices.
 
-Added in 0.95 is restarting the DTLS session after a few failed polls. This fixes a previous issue where after a reset of the gateway
-a manual reset of this application was required to rebuild the CoAP DTLS context.
+Added in 0.95 is restarting the DTLS session after a few failed polls. This fixes a previous issue where after a reset of the gateway a manual reset of this application was required to rebuild the CoAP DTLS context.
 
-Added in 0.97 is support for fyrtur blinds (should also work with kadrilj). Also monitoring of battery status for battery powered devices  
-like blinds and remote controls.
+Added in 0.97 is support for fyrtur blinds (should also work with kadrilj). Also monitoring of battery status for battery powered devices like blinds and remote controls.
 
 ## MQTT commands
 For status subscribe to tradfri/status/#  
@@ -60,12 +54,11 @@ if mains power state changes **tradfri/status/\<devicename>/mains** and **tradfr
 blinds:
 if level changes **tradfri/status/\<devicename>/level** and **tradfri/status/\<deviceid>/level** message is **'0.0'** - **'100.0'**   
 battery state:
-if status changes **tradfri/status/\<devicename>/battery** and **tradfri/status/\<deviceid>/battery** message is **'0'** - **'100'**
+if status changes **tradfri/status/\<devicename>/battery** and **tradfri/status/\<deviceid>/battery** message is **'0'** - **'100'**  
 Also 'low' state **tradfri/status/\<devicename>/batterylow** and **tradfri/status/\<deviceid>/batterylow** message is **'true'** or **'false'**
 
 devicename is the name of the individual device from the tradfri application  
 deviceid is the internal identifier used by the tradfri gateway  
 
-To send commands publish to **tradfri/set/\<devicename>/\<parameter>** or **tradfri/set/\<deviceid>/\<parameter>** or **tradfri/set/\<groupname>/\<parameter>**   
-'power', 'brightness' and 'temp' parameters are writeable but will be ignored if not valid for the device type (e.g. temp for single-colour bulbs or outlets).  
+To send commands publish to **tradfri/set/\<devicename>/\<parameter>** or **tradfri/set/\<deviceid>/\<parameter>** or **tradfri/set/\<groupname>/\<parameter>** 'power', 'brightness' and 'temp' parameters are writeable but will be ignored if not valid for the device type (e.g. temp for single-colour bulbs or outlets).  
 groupname can be used to set all devices within a group (group name from tradfri app).  
